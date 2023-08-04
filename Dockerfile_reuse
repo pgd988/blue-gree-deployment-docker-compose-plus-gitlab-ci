@@ -1,0 +1,10 @@
+ARG CONTAINER_ENV_ARG
+ARG CONTAINER_VERSION_ARG
+FROM gcr.io/[put your app image path here ]:${CONTAINER_VERSION_ARG}
+
+ARG CONF_TYPE_ARG
+WORKDIR /app
+
+#the folowing part is here as an example of how to update config files in a pre-existed docker image
+RUN rm -rf ./config.yaml
+COPY ./${CONF_TYPE_ARG}.config.yaml ./config.yaml

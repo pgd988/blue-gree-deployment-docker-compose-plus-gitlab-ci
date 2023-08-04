@@ -1,0 +1,169 @@
+stages:
+  - scheduling
+  - build
+  - ci_update
+  - deploy
+  - startup_check
+  - relabeling
+  - nginx_reload
+  - clean
+  - post_features
+
+variables:
+  REGISTRY: put your registry address here
+  DOCKER_IMAGE: ${REGISTRY}your-custom-docker-image-here or just regular docker image
+# CLOUD_PROJECT:
+  DOCKER_DRIVER: overlay2
+  APP00_VM: [VM IP ADDRESS HERE]
+  CONFIG_REPO: [put your config repository here]
+  GITLAB_HOST_URL: [put your gitlab host url here. gitlab.com for instance]
+  DEV_CONSOLE_PK:
+  CI_REPO_URL: [put the url of the current repository here]
+  DEPLOY_USER: [put the username you have chosen for deploy here and make sure that the user is actually exist ion the $APP00_VM ]
+
+#  MONGO_URI: mongodb://mongo:27017/data
+#  RABBIT_URI: amqp://rabbitmq:5672
+
+#cache:
+#  untracked: true
+#  key: "$CI_BUILD_REF_NAME"
+#  paths:
+#    - node_modules/
+######################################################################################################################################################
+.before_script_template: &default_before_script
+  before_script:
+    - export PATH=$PATH:/root/google-cloud-sdk/bin
+    - export TAG=$(git describe --tags --always)
+    - export IMG_PATH=${REGISTRY}/${IMG}
+    - export CONTAINER=${IMG_PATH}:${CI_COMMIT_REF_NAME}_${TAG}_${CI_PIPELINE_ID}
+    - git clone -b master https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.yourdomain/the-repository-with-this-code ./my-ci-repo
+    - mv ./my-ci-repo/* ./
+
+.script_template: &default_script
+  script:
+#    - gcloud auth activate-service-account --key-file=./my-ci-repo/key.json --project ${CLOUD_PROJECT}
+    - >
+      if [ -n "$TAG" ]; then
+        export SCHECK=$(gcloud container images list-tags ${IMG_PATH} | grep $TAG)
+        if [ -n "$SCHECK" ]; then
+          git clone -b master https://gitlab-ci-token:${CI_JOB_TOKEN}@${CONFIG_REPO} ./my-conf-repo
+          sed 's/^./ENV &/' ./my-conf-repo/${ENVD}.env > ./my-conf-repo/env_tmp
+          cat ./my-conf-repo/env_tmp >> ./Dockerfile_reuse
+          docker login -u _json_key -p "$(cat ./my-ci-repo/key.json)" https://gcr.io
+          export LAST_CONTAINER_IMAGE=$(gcloud container images list-tags ${IMG_PATH} | grep $TAG | awk {'print$2'} | awk -F "," {'print$1'} | tail -n 1)
+          docker build --no-cache --build-arg CONF_TYPE_ARG="${ENVD}" --build-arg CONTAINER_VERSION_ARG="${LAST_CONTAINER_IMAGE}" --build-arg CONTAINER_ENV_ARG="${ENVD}" -t $CONTAINER . -f ./Dockerfile_reuse
+          docker push $CONTAINER
+        else
+          git clone -b master https://gitlab-ci-token:${CI_JOB_TOKEN}@${CONFIG_REPO} ./my-conf-repo
+          sed 's/^./ENV &/' ./my-conf-repo/${ENVD}.env > ./my-conf-repo/env_tmp
+          cat ./my-conf-repo/env_tmp >> ./Dockerfile
+          docker login -u _json_key -p "$(cat ./my-ci-repo/key.json)" https://gcr.io
+          docker build --no-cache --build-arg CONF_TYPE_ARG="${ENVD}" -t $CONTAINER . -f ./Dockerfile
+          docker push $CONTAINER
+        fi
+      fi
+
+######################################################################################################################################################
+Scheduling:
+  stage: scheduling
+  image: docker
+  retry: 2
+  before_script:
+    - apk add curl
+  script:
+    - |
+      printf 'Waiting...'
+      while true; do
+        READY=$(curl -sS -k --header "PRIVATE-TOKEN: $(cat /gitlab-api/key)" "https://${GITLAB_HOST_URL}/api/v4/projects/${CI_PROJECT_ID}/pipelines?order_by=id&sort=asc&scope=running" | jq '.[0].id=='"${CI_PIPELINE_ID}")
+        if [ "${READY}" = "true" ]; then
+          printf '\nReady!'
+          exit 0
+        else
+          printf '.'
+          sleep 20
+        fi
+      done
+  only:
+    - master
+
+#######################################################################################################################################################
+
+Build_DEV:
+  stage: build
+  image: ${DOCKER_IMAGE}
+  variables:
+    IMG: [put here your app's docker image path in your private registry ]
+    ENVD: develop
+  <<: *default_before_script
+  <<: *default_script
+  retry: 2
+  only:
+    - develop_disabled
+
+Build_PROD:
+  stage: build
+  image: ${DOCKER_IMAGE}
+  variables:
+    IMG: [put here your app's docker image path in your private registry ]
+    ENVD: production
+  <<: *default_before_script
+  <<: *default_script
+  retry: 2
+  only:
+    - master
+
+################################# DEPLOY
+
+CI_UPDATE_PROD:
+  stage: ci_update
+  image: docker
+  <<: *default_before_script
+  script:
+    - echo $DEV_CONSOLE_PK > ./pk.key && chmod 400 ./pk.key
+    - ssh -o StrictHostKeyChecking=no -i /ssh-keys/rsa-dev-console-01 ${DEPLOY_USER}@${APP00_VM} "mv /opt/app/deploy /opt/app/deploy_bak"
+    - ssh -o StrictHostKeyChecking=no -i /ssh-keys/rsa-dev-console-01 ${DEPLOY_USER}@${APP00_VM} "cd /opt/app/deploy && git clone ${CI_REPO_URL} ./my-ci-repo && mv ./my-ci-repo/deploy/* ./ && rm -rf ./my-ci-repo"
+  only:
+    - master
+  allow_failure: false
+
+
+Deploy_PROD:
+  stage: deploy
+  image: docker
+  <<: *default_before_script
+  script:
+    - echo $DEV_CONSOLE_PK > ./pk.key && chmod 400 ./pk.key
+    - ssh -o StrictHostKeyChecking=no -i /ssh-keys/rsa-dev-console-01 ${DEPLOY_USER}@${APP00_VM} "cd /opt/app/ && sudo mkdir ${CI_PIPELINE_ID} && sudo cp /opt/app/deploy/docker-compose_template.yaml /opt/app/${CI_PIPELINE_ID}/docker-compose.yaml && cd /opt/app/${CI_PIPELINE_ID} &&  sudo sed -i \"s/latest/${CI_COMMIT_REF_NAME}_${TAG}_${CI_PIPELINE_ID}/\" ./docker-compose.yaml"
+    - ssh -o StrictHostKeyChecking=no -i /ssh-keys/rsa-dev-console-01 ${DEPLOY_USER}@${APP00_VM} "cd /opt/app/${CI_PIPELINE_ID} && sudo docker-compose up -d && sudo /opt/app/deploy/traffic_switching.sh ${CI_PIPELINE_ID}"
+    - ssh -o StrictHostKeyChecking=no -i /ssh-keys/rsa-dev-console-01 ${DEPLOY_USER}@${APP00_VM} "rm -rf /opt/app/deploy_bak"
+  only:
+    - master
+  allow_failure: false
+
+########################################################## CLEAN UP #################################################################################
+Clean_up_Dev:
+  stage: clean
+  image: ${DOCKER_IMAGE}
+  variables:
+    IMG: [put here your app's docker image path in your private registry ]
+    ENVD: develop
+  <<: *default_before_script
+  script:
+    - docker image rm ${CONTAINER}
+  only:
+    - develop_disabled
+
+Clean_up_PROD:
+  stage: clean
+  image: ${DOCKER_IMAGE}
+  variables:
+    IMG: [put here your app's docker image path in your private registry ]
+    ENVD: production
+  <<: *default_before_script
+  script:
+    - docker image rm ${CONTAINER}
+  only:
+    - master
+
+##################################################################################################################################################
+#### End

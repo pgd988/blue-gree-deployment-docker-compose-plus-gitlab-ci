@@ -1,0 +1,21 @@
+version: "3.9"
+services:
+  backend:
+    image: gcr.io/[put your docker image path here]
+    ports:
+      - "3001:3001" # whatever port your app listens
+    healthcheck:
+      test: ["CMD", "nc", "-zv", "localhost", "3001"] # and here as well
+      interval: 1m30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: '2049M'
+        reservations:
+          cpus: '1'
+          memory: '1024M'
